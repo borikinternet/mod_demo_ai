@@ -118,6 +118,290 @@ static switch_status_t do_config(switch_bool_t reload)
 //#define _switch_stun_packet_next_attribute(attribute, end) (attribute && (attribute = (switch_stun_packet_attribute_t *) (attribute->value +  _switch_stun_attribute_padded_length(attribute))) && ((void *)attribute < end) && ((void *)(attribute +  _switch_stun_attribute_padded_length(attribute)) < end))
 
 #define MAX_PEERS 128
+
+#define DEMO_AI_TAKEOVER_SYNTAX "<uuid> <profile>"
+#define DEMO_AI_TECHNOLOGY "sofia"
+
+static switch_status_t demo_ai_execute_sql(switch_cache_db_handle_t *db, char *sql, switch_stream_handle_t *stream)
+{
+	char *errmsg = NULL;
+	switch_status_t status;
+
+	status = switch_cache_db_execute_sql(db, sql, &errmsg);
+
+	if (errmsg) {
+		if (stream) {
+			stream->write_function(stream, "-ERR SQL error: %s\n", errmsg);
+		}
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "mod_demo_ai SQL error: %s\n", errmsg);
+		switch_safe_free(errmsg);
+	}
+
+	return status;
+}
+
+static int demo_ai_count_recovery_rows(switch_cache_db_handle_t *db,
+							   const char *uuid,
+							   const char *profile,
+							   const char *technology,
+							   switch_stream_handle_t *stream)
+{
+	char *sql;
+	char *errmsg = NULL;
+	char count_buf[32] = "0";
+	const char *runtime_uuid = switch_core_get_uuid();
+
+	sql = switch_mprintf("select count(*) from recovery where runtime_uuid!='%q' and technology='%q' and profile_name='%q' and uuid='%q'",
+			runtime_uuid,
+			technology,
+			profile,
+			uuid);
+
+	if (!sql) {
+		if (stream) {
+			stream->write_function(stream, "-ERR memory allocation failure\n");
+		}
+		return -1;
+	}
+
+	switch_cache_db_execute_sql2str(db, sql, count_buf, sizeof(count_buf), &errmsg);
+
+	if (errmsg) {
+		if (stream) {
+			stream->write_function(stream, "-ERR SQL error: %s\n", errmsg);
+		}
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "mod_demo_ai SQL error: %s\n", errmsg);
+		switch_safe_free(errmsg);
+		switch_safe_free(sql);
+		return -1;
+	}
+
+	switch_safe_free(sql);
+
+	return atoi(count_buf);
+}
+
+static switch_status_t demo_ai_restore_held_rows(switch_cache_db_handle_t *db,
+							  const char *profile,
+							  const char *hold_technology,
+							  switch_stream_handle_t *stream)
+{
+	char *sql;
+	const char *runtime_uuid = switch_core_get_uuid();
+	switch_status_t status;
+
+	sql = switch_mprintf("update recovery set technology='%q' where runtime_uuid!='%q' and profile_name='%q' and technology='%q'",
+			DEMO_AI_TECHNOLOGY,
+			runtime_uuid,
+			profile,
+			hold_technology);
+
+	if (!sql) {
+		if (stream) {
+			stream->write_function(stream, "-ERR memory allocation failure\n");
+		}
+		return SWITCH_STATUS_MEMERR;
+	}
+
+	status = demo_ai_execute_sql(db, sql, stream);
+	switch_safe_free(sql);
+
+	return status;
+}
+
+static switch_status_t demo_ai_isolate_target_recovery(switch_cache_db_handle_t *db,
+								const char *uuid,
+								const char *profile,
+								const char *hold_technology,
+								int *held_rows,
+								switch_stream_handle_t *stream)
+{
+	char *sql;
+	const char *runtime_uuid = switch_core_get_uuid();
+	switch_status_t status;
+	int target_count;
+
+	sql = switch_mprintf("update recovery set technology='%q' where runtime_uuid!='%q' and technology='%q' and profile_name='%q' and uuid!='%q'",
+			hold_technology,
+			runtime_uuid,
+			DEMO_AI_TECHNOLOGY,
+			profile,
+			uuid);
+
+	if (!sql) {
+		if (stream) {
+			stream->write_function(stream, "-ERR memory allocation failure\n");
+		}
+		return SWITCH_STATUS_MEMERR;
+	}
+
+	status = demo_ai_execute_sql(db, sql, stream);
+	switch_safe_free(sql);
+
+	if (status != SWITCH_STATUS_SUCCESS) {
+		return status;
+	}
+
+	*held_rows = switch_cache_db_affected_rows(db);
+	target_count = demo_ai_count_recovery_rows(db, uuid, profile, DEMO_AI_TECHNOLOGY, stream);
+
+	if (target_count != 1) {
+		demo_ai_restore_held_rows(db, profile, hold_technology, NULL);
+		if (stream) {
+			stream->write_function(stream, "-ERR expected exactly one target recovery row, got %d\n", target_count);
+		}
+		return SWITCH_STATUS_FALSE;
+	}
+
+	return SWITCH_STATUS_SUCCESS;
+}
+
+static switch_status_t demo_ai_run_sofia_profile_recover(const char *profile, switch_stream_handle_t *stream)
+{
+	switch_stream_handle_t api_stream = { 0 };
+	char *cmd;
+	switch_status_t status;
+
+	SWITCH_STANDARD_STREAM(api_stream);
+	cmd = switch_mprintf("profile %s recover", profile);
+
+	if (!cmd) {
+		return SWITCH_STATUS_MEMERR;
+	}
+
+	status = switch_api_execute("sofia", cmd, NULL, &api_stream);
+
+	if (stream && api_stream.data) {
+		stream->write_function(stream, "sofia recover output: %s\n", (char *) api_stream.data);
+	}
+
+	switch_safe_free(cmd);
+	switch_safe_free(api_stream.data);
+
+	return status;
+}
+
+static switch_bool_t demo_ai_session_exists(const char *uuid)
+{
+	switch_core_session_t *session;
+
+	if ((session = switch_core_session_locate(uuid))) {
+		switch_core_session_rwunlock(session);
+		return SWITCH_TRUE;
+	}
+
+	return SWITCH_FALSE;
+}
+
+static switch_status_t demo_ai_trigger_media_reneg(const char *uuid)
+{
+	switch_stream_handle_t api_stream = { 0 };
+	char *cmd;
+	switch_status_t status;
+
+	SWITCH_STANDARD_STREAM(api_stream);
+	cmd = switch_mprintf("+%s", uuid);
+
+	if (!cmd) {
+		return SWITCH_STATUS_MEMERR;
+	}
+
+	status = switch_api_execute("uuid_media_reneg", cmd, NULL, &api_stream);
+
+	switch_safe_free(cmd);
+	switch_safe_free(api_stream.data);
+
+	return status;
+}
+
+SWITCH_STANDARD_API(demo_ai_takeover_function)
+{
+	char *mycmd = NULL;
+	char *argv[2] = { 0 };
+	int argc = 0;
+	const char *uuid;
+	const char *profile;
+	switch_cache_db_handle_t *db = NULL;
+	char *hold_technology = NULL;
+	int target_count;
+	int held_rows = 0;
+	switch_status_t status;
+	switch_status_t recover_status = SWITCH_STATUS_FALSE;
+
+	if (!zstr(cmd) && (mycmd = strdup(cmd))) {
+		argc = switch_separate_string(mycmd, ' ', argv, (sizeof(argv) / sizeof(argv[0])));
+	}
+
+	if (zstr(cmd) || argc != 2 || zstr(argv[0]) || zstr(argv[1])) {
+		stream->write_function(stream, "-USAGE: %s\n", DEMO_AI_TAKEOVER_SYNTAX);
+		goto done;
+	}
+
+	uuid = argv[0];
+	profile = argv[1];
+
+	if (switch_core_db_handle(&db) != SWITCH_STATUS_SUCCESS) {
+		stream->write_function(stream, "-ERR Database error\n");
+		goto done;
+	}
+
+	target_count = demo_ai_count_recovery_rows(db, uuid, profile, DEMO_AI_TECHNOLOGY, stream);
+	if (target_count != 1) {
+		stream->write_function(stream, "-ERR target recovery row not found or not unique (count=%d)\n", target_count);
+		goto done;
+	}
+
+	hold_technology = switch_mprintf("demo_ai_hold_%s", switch_core_get_uuid());
+	if (!hold_technology) {
+		stream->write_function(stream, "-ERR memory allocation failure\n");
+		goto done;
+	}
+
+	status = demo_ai_isolate_target_recovery(db, uuid, profile, hold_technology, &held_rows, stream);
+	if (status != SWITCH_STATUS_SUCCESS) {
+		goto done;
+	}
+
+	recover_status = demo_ai_run_sofia_profile_recover(profile, stream);
+
+	status = demo_ai_restore_held_rows(db, profile, hold_technology, stream);
+	if (status != SWITCH_STATUS_SUCCESS) {
+		stream->write_function(stream, "-ERR failed to restore held recovery rows\n");
+		goto done;
+	}
+
+	if (recover_status != SWITCH_STATUS_SUCCESS) {
+		stream->write_function(stream, "-ERR sofia recover execution failed\n");
+		goto done;
+	}
+
+	if (!demo_ai_session_exists(uuid)) {
+		stream->write_function(stream, "-ERR target uuid %s is not active after recover\n", uuid);
+		goto done;
+	}
+
+	status = demo_ai_trigger_media_reneg(uuid);
+	if (status != SWITCH_STATUS_SUCCESS) {
+		stream->write_function(stream, "-ERR target recovered, but media renegotiation trigger failed\n");
+		goto done;
+	}
+
+	stream->write_function(stream,
+		"+OK takeover completed: uuid=%s profile=%s isolated_rows=%d\n",
+		uuid,
+		profile,
+		held_rows);
+
+done:
+	if (db) {
+		switch_cache_db_release_db_handle(&db);
+	}
+	switch_safe_free(hold_technology);
+	switch_safe_free(mycmd);
+
+	return SWITCH_STATUS_SUCCESS;
+}
+
 SWITCH_STANDARD_API(skel_function)
 {
 	switch_dial_handle_t *dh;
@@ -256,6 +540,7 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_skel_load)
 	do_config(SWITCH_FALSE);
 
 	SWITCH_ADD_API(api_interface, "skel", "Skel API", skel_function, "syntax");
+	SWITCH_ADD_API(api_interface, "demo_ai_takeover", "Recover one call on this node via sofia recovery", demo_ai_takeover_function, DEMO_AI_TAKEOVER_SYNTAX);
 
 	switch_channel_bind_device_state_handler(mycb, NULL);
 
