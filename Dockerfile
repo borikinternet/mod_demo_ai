@@ -37,10 +37,10 @@ RUN --mount=type=secret,id=signalwire_token \
         cmake \
         clang \
         gdb; \
-    apt-get build-dep -y freeswitch #; \
-#    rm -f /etc/apt/apt.conf.d/99proxy; \
-#    rm -f /etc/apt/auth.conf; \
-#    rm -rf /var/lib/apt/lists/*;
+    apt-get build-dep -y freeswitch ; \
+    rm -f /etc/apt/apt.conf.d/99proxy; \
+    rm -f /etc/apt/auth.conf; \
+    rm -rf /var/lib/apt/lists/*;
 
 VOLUME /usr/src/freeswitch
 
