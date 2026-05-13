@@ -27,20 +27,19 @@
  * Neal Horman <neal at wanlink dot com>
  *
  *
- * mod_skel.c -- Framework Demo Module
+ * mod_demo_ai.c -- Demo AI recovery module
  *
  */
 #include <switch.h>
 
 /* Prototypes */
-SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_skel_shutdown);
-SWITCH_MODULE_RUNTIME_FUNCTION(mod_skel_runtime);
-SWITCH_MODULE_LOAD_FUNCTION(mod_skel_load);
+SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_demo_ai_shutdown);
+SWITCH_MODULE_LOAD_FUNCTION(mod_demo_ai_load);
 
 /* SWITCH_MODULE_DEFINITION(name, load, shutdown, runtime)
  * Defines a switch_loadable_module_function_table_t and a static const char[] modname
  */
-SWITCH_MODULE_DEFINITION(mod_skel, mod_skel_load, mod_skel_shutdown, NULL);
+SWITCH_MODULE_DEFINITION(mod_demo_ai, mod_demo_ai_load, mod_demo_ai_shutdown, NULL);
 
 typedef enum {
 	CODEC_NEGOTIATION_GREEDY = 1,
@@ -121,6 +120,7 @@ static switch_status_t do_config(switch_bool_t reload)
 
 #define DEMO_AI_TAKEOVER_SYNTAX "<uuid> <profile>"
 #define DEMO_AI_TECHNOLOGY "sofia"
+#define DEMO_AI_METADATA_BUFFER_LEN (256 * 1024)
 
 static switch_status_t demo_ai_execute_sql(switch_cache_db_handle_t *db, char *sql, switch_stream_handle_t *stream)
 {
@@ -181,6 +181,181 @@ static int demo_ai_count_recovery_rows(switch_cache_db_handle_t *db,
 	return atoi(count_buf);
 }
 
+static int demo_ai_count_bridge_rows(switch_cache_db_handle_t *db,
+						 const char *uuid,
+						 switch_stream_handle_t *stream)
+{
+	char *sql;
+	char *errmsg = NULL;
+	char count_buf[32] = "0";
+
+	sql = switch_mprintf("select count(*) from calls where caller_uuid='%q' or callee_uuid='%q'",
+			uuid,
+			uuid);
+
+	if (!sql) {
+		if (stream) {
+			stream->write_function(stream, "-ERR memory allocation failure\n");
+		}
+		return -1;
+	}
+
+	switch_cache_db_execute_sql2str(db, sql, count_buf, sizeof(count_buf), &errmsg);
+
+	if (errmsg) {
+		if (stream) {
+			stream->write_function(stream, "-ERR SQL error: %s\n", errmsg);
+		}
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "mod_demo_ai SQL error: %s\n", errmsg);
+		switch_safe_free(errmsg);
+		switch_safe_free(sql);
+		return -1;
+	}
+
+	switch_safe_free(sql);
+
+	return atoi(count_buf);
+}
+
+static switch_status_t demo_ai_find_bridge_peer_uuid(switch_cache_db_handle_t *db,
+							 const char *uuid,
+							 char *peer_uuid,
+							 switch_size_t peer_uuid_len,
+							 switch_stream_handle_t *stream)
+{
+	char *sql;
+	char *errmsg = NULL;
+
+	peer_uuid[0] = '\0';
+
+	sql = switch_mprintf("select case when caller_uuid='%q' then callee_uuid else caller_uuid end "
+						 "from calls where caller_uuid='%q' or callee_uuid='%q' limit 1",
+			uuid,
+			uuid,
+			uuid);
+
+	if (!sql) {
+		if (stream) {
+			stream->write_function(stream, "-ERR memory allocation failure\n");
+		}
+		return SWITCH_STATUS_MEMERR;
+	}
+
+	switch_cache_db_execute_sql2str(db, sql, peer_uuid, peer_uuid_len, &errmsg);
+
+	if (errmsg) {
+		if (stream) {
+			stream->write_function(stream, "-ERR SQL error: %s\n", errmsg);
+		}
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "mod_demo_ai SQL error: %s\n", errmsg);
+		switch_safe_free(errmsg);
+		switch_safe_free(sql);
+		return SWITCH_STATUS_FALSE;
+	}
+
+	switch_safe_free(sql);
+
+	return SWITCH_STATUS_SUCCESS;
+}
+
+static switch_status_t demo_ai_find_recovery_peer_uuid(switch_cache_db_handle_t *db,
+							 const char *uuid,
+							 const char *profile,
+							 char *peer_uuid,
+							 switch_size_t peer_uuid_len,
+							 switch_stream_handle_t *stream)
+{
+	static const char *peer_var_names[] = {
+		"signal_bond",
+		"bridge_uuid",
+		"bridge_to",
+		"last_bridge_to",
+		"originator",
+		"originating_leg_uuid",
+		NULL
+	};
+	char *sql;
+	char *errmsg = NULL;
+	char *metadata;
+	switch_xml_t cdr = NULL;
+	switch_xml_t variables = NULL;
+	switch_status_t status = SWITCH_STATUS_SUCCESS;
+	const char *runtime_uuid = switch_core_get_uuid();
+	int i;
+
+	peer_uuid[0] = '\0';
+
+	metadata = malloc(DEMO_AI_METADATA_BUFFER_LEN);
+	if (!metadata) {
+		if (stream) {
+			stream->write_function(stream, "-ERR memory allocation failure\n");
+		}
+		return SWITCH_STATUS_MEMERR;
+	}
+	memset(metadata, 0, DEMO_AI_METADATA_BUFFER_LEN);
+
+	sql = switch_mprintf("select metadata from recovery where runtime_uuid!='%q' and technology='%q' and profile_name='%q' and uuid='%q'",
+			runtime_uuid,
+			DEMO_AI_TECHNOLOGY,
+			profile,
+			uuid);
+
+	if (!sql) {
+		if (stream) {
+			stream->write_function(stream, "-ERR memory allocation failure\n");
+		}
+		switch_safe_free(metadata);
+		return SWITCH_STATUS_MEMERR;
+	}
+
+	switch_cache_db_execute_sql2str(db, sql, metadata, DEMO_AI_METADATA_BUFFER_LEN, &errmsg);
+
+	if (errmsg) {
+		if (stream) {
+			stream->write_function(stream, "-ERR SQL error: %s\n", errmsg);
+		}
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "mod_demo_ai SQL error: %s\n", errmsg);
+		switch_safe_free(errmsg);
+		switch_safe_free(sql);
+		switch_safe_free(metadata);
+		return SWITCH_STATUS_FALSE;
+	}
+
+	switch_safe_free(sql);
+
+	if (zstr(metadata)) {
+		switch_safe_free(metadata);
+		return SWITCH_STATUS_SUCCESS;
+	}
+
+	cdr = switch_xml_parse_str_dup(metadata);
+	if (!cdr) {
+		if (stream) {
+			stream->write_function(stream, "-ERR failed to parse recovery metadata for uuid=%s\n", uuid);
+		}
+		switch_safe_free(metadata);
+		return SWITCH_STATUS_FALSE;
+	}
+
+	variables = switch_xml_child(cdr, "variables");
+	if (variables) {
+		for (i = 0; peer_var_names[i]; i++) {
+			switch_xml_t peer_var = switch_xml_child(variables, peer_var_names[i]);
+			const char *value = switch_xml_txt(peer_var);
+
+			if (!zstr(value) && strcmp(value, uuid)) {
+				switch_copy_string(peer_uuid, value, peer_uuid_len);
+				break;
+			}
+		}
+	}
+
+	switch_xml_free(cdr);
+	switch_safe_free(metadata);
+
+	return status;
+}
+
 static switch_status_t demo_ai_restore_held_rows(switch_cache_db_handle_t *db,
 							  const char *profile,
 							  const char *hold_technology,
@@ -209,8 +384,9 @@ static switch_status_t demo_ai_restore_held_rows(switch_cache_db_handle_t *db,
 	return status;
 }
 
-static switch_status_t demo_ai_isolate_target_recovery(switch_cache_db_handle_t *db,
+static switch_status_t demo_ai_isolate_call_recovery(switch_cache_db_handle_t *db,
 								const char *uuid,
+								const char *peer_uuid,
 								const char *profile,
 								const char *hold_technology,
 								int *held_rows,
@@ -220,13 +396,24 @@ static switch_status_t demo_ai_isolate_target_recovery(switch_cache_db_handle_t 
 	const char *runtime_uuid = switch_core_get_uuid();
 	switch_status_t status;
 	int target_count;
+	int peer_count = 0;
 
-	sql = switch_mprintf("update recovery set technology='%q' where runtime_uuid!='%q' and technology='%q' and profile_name='%q' and uuid!='%q'",
+	if (zstr(peer_uuid)) {
+		sql = switch_mprintf("update recovery set technology='%q' where runtime_uuid!='%q' and technology='%q' and profile_name='%q' and uuid!='%q'",
+				hold_technology,
+				runtime_uuid,
+				DEMO_AI_TECHNOLOGY,
+				profile,
+				uuid);
+	} else {
+		sql = switch_mprintf("update recovery set technology='%q' where runtime_uuid!='%q' and technology='%q' and profile_name='%q' and uuid!='%q' and uuid!='%q'",
 			hold_technology,
 			runtime_uuid,
 			DEMO_AI_TECHNOLOGY,
 			profile,
-			uuid);
+				uuid,
+				peer_uuid);
+	}
 
 	if (!sql) {
 		if (stream) {
@@ -243,12 +430,16 @@ static switch_status_t demo_ai_isolate_target_recovery(switch_cache_db_handle_t 
 	}
 
 	*held_rows = switch_cache_db_affected_rows(db);
-	target_count = demo_ai_count_recovery_rows(db, uuid, profile, DEMO_AI_TECHNOLOGY, stream);
 
-	if (target_count != 1) {
+	target_count = demo_ai_count_recovery_rows(db, uuid, profile, DEMO_AI_TECHNOLOGY, stream);
+	if (!zstr(peer_uuid)) {
+		peer_count = demo_ai_count_recovery_rows(db, peer_uuid, profile, DEMO_AI_TECHNOLOGY, stream);
+	}
+
+	if (target_count != 1 || (!zstr(peer_uuid) && peer_count != 1)) {
 		demo_ai_restore_held_rows(db, profile, hold_technology, NULL);
 		if (stream) {
-			stream->write_function(stream, "-ERR expected exactly one target recovery row, got %d\n", target_count);
+			stream->write_function(stream, "-ERR expected target and peer recovery rows, got target=%d peer=%d\n", target_count, peer_count);
 		}
 		return SWITCH_STATUS_FALSE;
 	}
@@ -323,8 +514,11 @@ SWITCH_STANDARD_API(demo_ai_takeover_function)
 	const char *profile;
 	switch_cache_db_handle_t *db = NULL;
 	char *hold_technology = NULL;
+	char peer_uuid[SWITCH_UUID_FORMATTED_LENGTH + 1] = "";
 	int target_count;
+	int bridge_rows;
 	int held_rows = 0;
+	int recovered_rows = 1;
 	switch_status_t status;
 	switch_status_t recover_status = SWITCH_STATUS_FALSE;
 
@@ -351,13 +545,50 @@ SWITCH_STANDARD_API(demo_ai_takeover_function)
 		goto done;
 	}
 
+	bridge_rows = demo_ai_count_bridge_rows(db, uuid, stream);
+	if (bridge_rows < 0) {
+		goto done;
+	}
+
+	if (bridge_rows > 1) {
+		stream->write_function(stream, "-ERR target uuid %s has ambiguous bridge rows (count=%d)\n", uuid, bridge_rows);
+		goto done;
+	}
+
+	if (bridge_rows == 1) {
+		status = demo_ai_find_bridge_peer_uuid(db, uuid, peer_uuid, sizeof(peer_uuid), stream);
+		if (status != SWITCH_STATUS_SUCCESS) {
+			goto done;
+		}
+	} else {
+		status = demo_ai_find_recovery_peer_uuid(db, uuid, profile, peer_uuid, sizeof(peer_uuid), stream);
+		if (status != SWITCH_STATUS_SUCCESS) {
+			goto done;
+		}
+	}
+
+	if (bridge_rows == 1 && zstr(peer_uuid)) {
+		stream->write_function(stream, "-ERR target uuid %s has bridge row but peer uuid is empty\n", uuid);
+		goto done;
+	}
+
+	if (!zstr(peer_uuid)) {
+		target_count = demo_ai_count_recovery_rows(db, peer_uuid, profile, DEMO_AI_TECHNOLOGY, stream);
+		if (target_count != 1) {
+			stream->write_function(stream, "-ERR peer recovery row not found or not unique: uuid=%s count=%d\n", peer_uuid, target_count);
+			goto done;
+		}
+
+		recovered_rows = 2;
+	}
+
 	hold_technology = switch_mprintf("demo_ai_hold_%s", switch_core_get_uuid());
 	if (!hold_technology) {
 		stream->write_function(stream, "-ERR memory allocation failure\n");
 		goto done;
 	}
 
-	status = demo_ai_isolate_target_recovery(db, uuid, profile, hold_technology, &held_rows, stream);
+	status = demo_ai_isolate_call_recovery(db, uuid, peer_uuid, profile, hold_technology, &held_rows, stream);
 	if (status != SWITCH_STATUS_SUCCESS) {
 		goto done;
 	}
@@ -380,6 +611,11 @@ SWITCH_STANDARD_API(demo_ai_takeover_function)
 		goto done;
 	}
 
+	if (!zstr(peer_uuid) && !demo_ai_session_exists(peer_uuid)) {
+		stream->write_function(stream, "-ERR peer uuid %s is not active after recover\n", peer_uuid);
+		goto done;
+	}
+
 	status = demo_ai_trigger_media_reneg(uuid);
 	if (status != SWITCH_STATUS_SUCCESS) {
 		stream->write_function(stream, "-ERR target recovered, but media renegotiation trigger failed\n");
@@ -387,9 +623,11 @@ SWITCH_STANDARD_API(demo_ai_takeover_function)
 	}
 
 	stream->write_function(stream,
-		"+OK takeover completed: uuid=%s profile=%s isolated_rows=%d\n",
+		"+OK takeover completed: uuid=%s peer_uuid=%s profile=%s recovered_rows=%d isolated_rows=%d\n",
 		uuid,
+		zstr(peer_uuid) ? "none" : peer_uuid,
 		profile,
+		recovered_rows,
 		held_rows);
 
 done:
@@ -528,18 +766,13 @@ static void mycb(switch_core_session_t *session, switch_channel_callstate_t call
 }
 
 
-/* Macro expands to: switch_status_t mod_skel_load(switch_loadable_module_interface_t **module_interface, switch_memory_pool_t *pool) */
-SWITCH_MODULE_LOAD_FUNCTION(mod_skel_load)
+/* Macro expands to: switch_status_t mod_demo_ai_load(switch_loadable_module_interface_t **module_interface, switch_memory_pool_t *pool) */
+SWITCH_MODULE_LOAD_FUNCTION(mod_demo_ai_load)
 {
 	switch_api_interface_t *api_interface;
 	/* connect my internal structure to the blank pointer passed to me */
 	*module_interface = switch_loadable_module_create_module_interface(pool, modname);
 
-	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "Hello World!\n");
-
-	do_config(SWITCH_FALSE);
-
-	SWITCH_ADD_API(api_interface, "skel", "Skel API", skel_function, "syntax");
 	SWITCH_ADD_API(api_interface, "demo_ai_takeover", "Recover one call on this node via sofia recovery", demo_ai_takeover_function, DEMO_AI_TAKEOVER_SYNTAX);
 
 	switch_channel_bind_device_state_handler(mycb, NULL);
@@ -550,8 +783,8 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_skel_load)
 
 /*
   Called when the system shuts down
-  Macro expands to: switch_status_t mod_skel_shutdown() */
-SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_skel_shutdown)
+  Macro expands to: switch_status_t mod_demo_ai_shutdown() */
+SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_demo_ai_shutdown)
 {
 	/* Cleanup dynamically allocated config settings */
 	switch_channel_unbind_device_state_handler(mycb);
@@ -563,8 +796,8 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_skel_shutdown)
 /*
   If it exists, this is called in it's own thread when the module-load completes
   If it returns anything but SWITCH_STATUS_TERM it will be called again automatically
-  Macro expands to: switch_status_t mod_skel_runtime()
-SWITCH_MODULE_RUNTIME_FUNCTION(mod_skel_runtime)
+  Macro expands to: switch_status_t mod_demo_ai_runtime()
+SWITCH_MODULE_RUNTIME_FUNCTION(mod_demo_ai_runtime)
 {
 	while(looping)
 	{
